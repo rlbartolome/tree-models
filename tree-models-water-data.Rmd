@@ -1,0 +1,518 @@
+---
+title: "STAT 218 - Analytics Project II"
+author: "Inigo Benavides and Rommel Bartolome"
+date: "March 13, 2019"
+abstract: "We created two tree-based models using a dataset collection of 300 sampled water districts in the Philippines. The first model is a regression tree model with water prices as the output variable while the second one is a categorical tree model where we created an output variable called wastage rating. A Pruned Decision Tree, a Random Forest and a Gradient Boosted Decision Tree was employed. It has been found that the best model for regression is the Random Forest at 0.246 RMSE. The Pruned Decision Tree on the other hand has been found to be the best model for classification with an optimal AUC of 0.535 and 56% Accuracy."
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+# Introduction
+
+In this project, we were given a dataset of 300 sampled water districts in the Philippines. The specific locations of the water districts have been anonymised and no reference year is provided. There was no autocorrelation, and we will assume that there would be no spatial correlation between districts. 
+
+
+Using this data, we will be creating two models using tree-based methods. The first model would be a regression tree model with the water prices as output variable while the second model would be a categorical tree model where we created a new output variable called `wastage rating`. For the `wastage rating`, if the percent of non-revenue water from total displaced water (`nrwpercent`) is less than or equal 25, we label it as 1 and 0 otherwise.
+
+
+We will be employing several tree-based modelling methods. First, we will try a simple Decision Tree and prune it accordingly. Then, we will use a Random Forest in an effort to improve our prediction. Lastly, we will employ boosting using Gradient Boosted Decision Trees. 
+
+
+# Data Loading and Cleaning
+
+
+Before creating our models, we first load all the libraries we will be using in this project:
+
+```{r message=FALSE}
+library("tidyverse")
+library("caret")
+library("GGally")
+library("car")
+library("pROC")
+library("randomForest")
+library("gbm")
+library("rpart")
+library("rpart.plot")
+```
+
+We will now clean our data and set our seed for reproducibility. Here, we factorize necessary variables and based on previous work, we transform and take the logarithm of `conn` (number of connections in a water district), `vol_nrw` (volume of non-revenue water in cu.m., which is displaced water in which the water district did not collect revenues) and `wd_rate` (water rate in pesos for a specific water district, as minimum charge for the first 10 cu. m.). We also simplify `Mun1` (number of first-class municipalities in the water district) as a binary decision while `conn_p_area` (number of connections per square kilometre) was squared. Lastly, the wastage rating which we will call as  `nrwpcent_class` is added for the classfication model. 
+
+```{r warning=FALSE, cache=TRUE}
+set.seed(1)
+df <- read_csv("data_BaBe.csv") %>%
+  select(-c(X1)) %>% #Remove insignificant column
+  mutate(REGION=as.factor(REGION),
+         WD.Area=as.factor(WD.Area),
+         Mun1=as.factor(case_when(Mun1 > 0 ~ 1, TRUE ~ 0)),
+         conn_log=log(conn),
+         vol_nrw_log=log(vol_nrw),
+         wd_rate_log=log(wd_rate),
+         conn_p_area_squared=conn_p_area^2,
+         nrwpcent_class=as.factor(case_when(nrwpcent <= 25 ~ 1, TRUE ~ 0)) 
+         # Engineer target classification variable
+         )
+```
+
+The data were then split to a train and a test dataset.
+
+```{r}
+# Train test split first 250 vs. last 50
+df_train <- df[1:250,]
+df_test <- df[251:300,]
+df %>% head
+```
+
+In the following sections, we will explore the fitting of the following models to our water district data set: (1) Decision Tree with Pruning, (2) Random Forest, and (3) Gradient Boosted Decision Trees. The first part will be for the Regression Tree Model while the latter parts will be for the Categorical Tree Model.
+
+# Regression Tree Models
+
+## Regression Decision Tree
+
+We grow first a simple basic unpruned tree:
+
+```{r}
+tree_model_simple <- df_train %>%
+  rpart(wd_rate ~ REGION + WD.Area + conn + conn_p_area + vol_nrw + nrwpcent + cities + 
+          Mun1 + Mun2 + Mun3 + Mun4 + Mun5 + gw + sprw + surw + elevar + coastal + emp
+        , data=., control=rpart.control(cp=0), model = TRUE)
+
+decision_tree_classifier <- df_train %>%
+  mutate(nrwpcent_class=as.factor(nrwpcent_class)) %>% 
+  rpart(nrwpcent_class ~ REGION + WD.Area + conn + conn_p_area + cities + 
+          Mun1 + Mun2 + Mun3 + Mun4 + Mun5 + gw + sprw + surw + 
+          elevar + coastal + emp, data=.,
+        control=rpart.control(cp=0.0), model=TRUE)
+```
+
+We visualize this tree:
+
+```{r}
+prp(tree_model_simple, varlen = 100, type=5,
+    split.round = .5,
+    cex=0.6,
+    fallen.leaves = TRUE,
+    main="Decision Tree Predictions - Unpruned"
+    )
+```
+
+Here, using all variables, we can see that this is a very "bushy" tree. We would like to check the effectiveness of this unpruned tree but before anything else, we will first create a helper function called `evaluateRMSE` that will help us evaluate the RMSE of the models:
+
+```{r}
+evaluateRMSE <- function(model, df_set) {
+  predictions <- model %>% predict(df_set) %>% as.vector()
+  obs <- df_set$wd_rate %>% as.vector()
+  rmse <- sqrt(mean((predictions - obs)^2)) / (mean(obs))
+  return(rmse)
+}
+```
+
+Evaluating our initial unpruned tree, 
+
+```{r}
+evaluateRMSE(tree_model_simple, df_test)
+```
+
+We get an RMSE of 0.342 using the basic unpruned tree. We prune it down by observing the behaviour of the complexity parameter (cp).
+
+```{r}
+printcp(tree_model_simple)
+plotcp(tree_model_simple)
+```
+
+Here, we can see that a `cp = 0.031` appears to be a good pruning parameter. We use it to prune the tree:
+```{r}
+tree_model <- df_train %>%
+  rpart(wd_rate ~ REGION + WD.Area + conn + conn_p_area + vol_nrw + nrwpcent + cities + 
+          Mun1 + Mun2 + Mun3 + Mun4 + Mun5 + gw + sprw + surw + elevar + coastal + emp
+        , data=., control=rpart.control(cp=0.031), model = TRUE)
+```
+
+Visualizing our pruned tree:
+
+```{r}
+prp(tree_model, varlen = 100, type=5,
+    split.round = .5,
+    cex=0.6,
+    fallen.leaves = TRUE,
+    main="Decision Tree Predictions - Pruned"
+    )
+```
+
+This looks very simple compared to our initial unpruned tree. We see that a split is made on the region level, separating `ARM`, `III`, `V`, `VII`, `XI`, `XII` with a prediction on the `wd_rate` of 216. Those predicted with regions `CAR`, `CARA`, `I`, `II`, `IV`, `IX`, `VI`, `VIII`, and `X` are then further split depending on `sprw` at a value of 2. We now check the RMSE and check if it has improved:
+
+```{r}
+df_test$model_prediction_decision_tree <- tree_model %>% predict(df_test)
+evaluateRMSE(tree_model, df_test)
+```
+
+By fitting a pruned decision tree model on the training set, with a complexity parameter of 0.031, we get a model with a test RMSE of 0.268, which is quite similar to our full linear regression model's performance of 0.26. However, this is definitely much better than our unpruned decision tree with an RMSE of 0.342.
+
+## Random Forest - Regression
+
+In Random Forest, we create lots of trees and then average them to reduce variance. We create our Random Forest using the `randomForest` function:
+
+```{r}
+set.seed(1)
+random_forest_model <- randomForest(wd_rate ~ REGION + WD.Area + conn + 
+                                      conn_p_area + vol_nrw + nrwpcent + 
+                                      cities + Mun1 + Mun2 + Mun3 + Mun4 + 
+                                      Mun5 + gw + sprw + surw + elevar + 
+                                      coastal + emp, data=df_train, importance=TRUE)
+
+random_forest_model %>% summary
+```
+
+
+```{r}
+random_forest_model$importance
+```
+
+Fitting a random forest model on the data set, we show the variable importances both in terms of the increase in MSE and increase in node purity. Among the most importance variables by MSE increase are `gw`, `vol_nrw`, `conn` and `conn_p_area`.
+
+```{r}
+df_test$model_prediction_random_forest <- random_forest_model %>% predict(df_test)
+evaluateRMSE(random_forest_model, df_test)
+```
+
+Above we find that the random forest outperforms both the linear regression and decision tree model with a test RMSE of 0.246.
+
+The parameters for tuning random forests are quite limited and for this one, we will just use `mtry`. We check the optimum `mtry` value:
+
+```{r}
+test.err <- double(18)
+for (mtry in 1:18){
+  set.seed(1)
+  random_forest_model <- randomForest(wd_rate ~ REGION + WD.Area + conn + conn_p_area + 
+                                        vol_nrw + nrwpcent + cities + Mun1 + Mun2 + Mun3 + 
+                                        Mun4 + Mun5 + gw + sprw + surw + elevar + coastal + 
+                                        emp, data=df_train, importance=TRUE, mtry = mtry)
+  test.err[mtry] <- evaluateRMSE(random_forest_model, df_test)
+}
+matplot(1:mtry, test.err, type = "b", pch = 19, ylab = "Mean Squared Error", 
+        xlab = "`mtry` value")
+```
+
+Here, we see that the most optimum `mtry` value, which is the number of variables randomly chosen at each split is at 12. We try to evaluate our Random Forest at this value:
+
+```{r}
+set.seed(1)
+random_forest_model <- randomForest(wd_rate ~ REGION + WD.Area + conn + conn_p_area + 
+                                        vol_nrw + nrwpcent + cities + Mun1 + Mun2 + Mun3 + 
+                                        Mun4 + Mun5 + gw + sprw + surw + elevar + coastal + 
+                                        emp, data=df_train, importance=TRUE, mtry = 12)
+evaluateRMSE(random_forest_model, df_test)
+  
+```
+
+Here, we can see that we achieved a slightly better but quite insignificant decrease in RMSE at 0.241. It seems that using the default `mtry` is sufficient in this model.
+
+## Gradient Boosted Regression Trees
+
+Lastly, we use boosting to create regression trees. Boosting tries to patch up the deficiencies of the current ensemble. We create our gradient boosted regression tree:
+
+```{r cache=TRUE}
+set.seed(1)
+gradient_boosted_model <- gbm(wd_rate ~ REGION + WD.Area + conn + conn_p_area + 
+                                vol_nrw + nrwpcent + cities + Mun1 + Mun2 + 
+                                Mun3 + Mun4 + Mun5 + gw + sprw + surw + elevar + 
+                                coastal + emp, data=df_train, distribution="gaussian",
+                              cv.folds=5)
+gradient_boosted_model %>% summary
+```
+
+Above, we fit a gradient boosted regression model with 5-fold cross validation on the data set and plot the relative influence of each variable.
+
+Indeed, we find that `REGION` has quite a high relative performance, followed by `conn_p_area` and `elevar`.
+
+```{r}
+# Check performance using 5-fold cross-validation
+set.seed(1)
+best.iter <- gbm.perf(gradient_boosted_model, method = "cv")
+print(best.iter)
+```
+
+```{r}
+# Plot relative influence of each variable
+par(mfrow = c(1, 2))
+summary(gradient_boosted_model, n.trees = 1)          # using first tree
+summary(gradient_boosted_model, n.trees = best.iter)  # using estimated best number of trees
+```
+
+If we check the relative performance of the variables between models with the first tree and the one with best number of trees as determined by cross validation, we find that `sprw` was important for the first model, and that `REGION` was again important for the optimal model.
+
+
+```{r}
+Yhat <- predict(gradient_boosted_model, newdata = df_test, 
+                n.trees = best.iter, type = "link")
+obs <- df_test$wd_rate %>% as.vector()
+rmse <- sqrt(mean((Yhat - obs)^2)) / (mean(obs))
+rmse
+```
+Interestingly, the GBM model yielded a comparable test RMSE of 0.261 to the pruned decision tree, slightly worse than random forest model.
+
+# Classification Problem
+
+In this section, we apply the same set of algorithms to the classification problem, taking out `vol_nrw` and `nrwpcent` from the predictors.
+
+## Decision Tree
+```{r}
+set.seed(1)
+decision_tree_classifier <- df_train %>%
+  mutate(nrwpcent_class=as.factor(nrwpcent_class)) %>% 
+  rpart(nrwpcent_class ~ REGION + WD.Area + conn + conn_p_area + cities + 
+          Mun1 + Mun2 + Mun3 + Mun4 + Mun5 + gw + sprw + surw + 
+          elevar + coastal + emp, data=.,
+        control=rpart.control(cp=0.0), model=TRUE)
+```
+
+```{r}
+cols <- ifelse(decision_tree_classifier$frame$yval == 1, "green4", "darkred")
+prp(decision_tree_classifier, varlen = 100, type=5, extra=106,
+    split.round = .5,
+    col=cols, border.col=cols,
+    cex=0.6,
+    fallen.leaves = TRUE,
+    main="Decision Tree Classification Predictions"
+    )
+```
+
+Above, we fit a decision tree model to predict `nrwpcent_class` with no constraint on the complexity, and we find that, again, `REGION` appears to be an important split. Checking its performance:
+
+```{r}
+df_test$model_prediction_decision_tree_classifier <- 
+  predict(decision_tree_classifier, df_test)[,1]
+decision_tree_classifier_roc <- roc(df_test$nrwpcent_class, 
+                                    df_test$model_prediction_decision_tree_classifier)
+
+auc_score <- decision_tree_classifier_roc$auc
+
+cbind(rev(decision_tree_classifier_roc$specificities), 
+      rev(decision_tree_classifier_roc$sensitivities)) %>% 
+  as.data.frame() %>% 
+  rename('Specificity'=V1, 'Sensitivity'=V2) %>% 
+  ggplot(aes(x=Specificity, y=Sensitivity)) +
+  geom_segment(aes(x = 0, y = 1, xend = 1,yend = 0), alpha = 0.5)  +
+  geom_step() +
+  scale_x_reverse(name = "Specificity",limits = c(1,0), expand = c(0.001,0.001)) +
+  scale_y_continuous(name = "Sensitivity", limits = c(0,1), expand = c(0.001, 0.001)) +
+  labs(title=paste("Area under the curve:", auc_score, sep=" ")) +
+  theme_minimal()
+```
+
+The AUC of this model is a marginal 0.547, indicating that it has little predictive power in the test set; indeed, since we removed the complexity parameter constraint, we see that the model severely overfits.
+
+```{r}
+# Confusion matrix
+predicted_probabilities <- df_test$model_prediction_decision_tree_classifier
+predicted_probabilities[predicted_probabilities > 0.5] <- 1
+predicted_probabilities[predicted_probabilities <= 0.5] <- 0
+predicted_probabilities <- predicted_probabilities %>% as.vector %>% as.factor
+observed <- df_test$nrwpcent_class
+confusionMatrix(data=predicted_probabilities, reference=observed)
+```
+
+
+By evaluating the model in terms of the test set confusion matrix, we find that this model has an accuracy of 48%, on par with our logistic regression model.
+
+We now try to prune our model. We check the complexity parameter:
+
+```{r}
+plotcp(decision_tree_classifier)
+```
+
+Here, it seems that the at `cp = 0.047`, the pruning will be optimal. We do the same process, and see the pruned tree:
+
+```{r}
+set.seed(1)
+decision_tree_classifier_pruned <- df_train %>% 
+  mutate(nrwpcent_class=as.factor(nrwpcent_class)) %>% 
+  rpart(nrwpcent_class ~ REGION + WD.Area + conn + conn_p_area + cities + 
+          Mun1 + Mun2 + Mun3 + Mun4 + Mun5 + gw + sprw + 
+          surw + elevar + coastal + emp, data=.,
+        control=rpart.control(cp=0.047), model=TRUE)
+cols <- ifelse(decision_tree_classifier_pruned$frame$yval == 1, "green4", "darkred")
+prp(decision_tree_classifier_pruned, varlen = 100, type=5, extra=106,
+    split.round = .5,
+    col=cols, border.col=cols,
+    cex=0.6,
+    fallen.leaves = TRUE,
+    main="Decision Tree Classification Predictions - Pruned"
+    )
+```
+
+Checking the AUC:
+
+```{r}
+df_test$model_prediction_decision_tree_classifier_pruned <- 
+  predict(decision_tree_classifier_pruned, df_test)[,1]
+decision_tree_classifier_roc_pruned <- 
+  roc(df_test$nrwpcent_class, 
+      df_test$model_prediction_decision_tree_classifier_pruned)
+
+auc_score <- decision_tree_classifier_roc_pruned$auc
+
+cbind(rev(decision_tree_classifier_roc_pruned$specificities), 
+      rev(decision_tree_classifier_roc_pruned$sensitivities)) %>% 
+  as.data.frame() %>% 
+  rename('Specificity'=V1, 'Sensitivity'=V2) %>% 
+  ggplot(aes(x=Specificity, y=Sensitivity)) +
+  geom_segment(aes(x = 0, y = 1, xend = 1,yend = 0), alpha = 0.5)  +
+  geom_step() +
+  scale_x_reverse(name = "Specificity",limits = c(1,0), expand = c(0.001,0.001)) +
+  scale_y_continuous(name = "Sensitivity", limits = c(0,1), expand = c(0.001, 0.001)) +
+  labs(title=paste("Area under the curve:", auc_score, sep=" ")) +
+  theme_minimal()
+```
+
+We achieved a slightly higher AUC of 0.535. We now check the accuracy:
+
+```{r}
+# Confusion matrix
+predicted_probabilities_pruned <- df_test$model_prediction_decision_tree_classifier_pruned
+predicted_probabilities_pruned[predicted_probabilities_pruned > 0.5] <- 1
+predicted_probabilities_pruned[predicted_probabilities_pruned <= 0.5] <- 0
+predicted_probabilities_pruned <- predicted_probabilities_pruned %>% as.vector %>% as.factor
+observed_pruned <- df_test$nrwpcent_class
+confusionMatrix(data=predicted_probabilities_pruned, reference=observed_pruned)
+```
+
+Here, even though we already pruned the decision tree, it still gives us an accuracy of 56%.
+
+## Random Forest
+
+```{r}
+set.seed(1)
+random_forest_classifier <- df_train %>% 
+  mutate(nrwpcent_class=as.factor(nrwpcent_class)) %>% 
+  randomForest(nrwpcent_class ~ REGION + WD.Area + conn + conn_p_area + 
+                 cities + Mun1 + Mun2 + Mun3 + Mun4 + Mun5 + gw + sprw + 
+                 surw + elevar + coastal + emp, data=., importance=TRUE)
+
+random_forest_classifier %>% summary
+```
+
+```{r}
+random_forest_classifier$importance
+```
+
+Above, we display the performance of each feature based on the fit random forest model.
+
+We now check its performance:
+
+```{r}
+df_test$model_prediction_random_forest_classifier <- 
+  predict(random_forest_classifier, newdata=df_test, type="prob")[,2]
+random_forest_classifier_roc <- roc(df_test$nrwpcent_class, 
+                                    df_test$model_prediction_random_forest_classifier)
+
+auc_score <- random_forest_classifier_roc$auc
+
+cbind(rev(random_forest_classifier_roc$specificities), 
+      rev(random_forest_classifier_roc$sensitivities)) %>% 
+  as.data.frame() %>% 
+  rename('Specificity'=V1, 'Sensitivity'=V2) %>% 
+  ggplot(aes(x=Specificity, y=Sensitivity)) +
+  geom_segment(aes(x = 0, y = 1, xend = 1,yend = 0), alpha = 0.5)  +
+  geom_step() +
+  scale_x_reverse(name = "Specificity",limits = c(1,0), 
+                  expand = c(0.001,0.001)) +
+  scale_y_continuous(name = "Sensitivity", limits = c(0,1), 
+                     expand = c(0.001, 0.001)) +
+  labs(title=paste("Area under the curve:", auc_score, sep=" ")) +
+  theme_minimal()
+```
+
+Interestingly, the random forest appears to perform slighty better than the decision tree model with an AUC of 0.550.
+
+```{r cache=TRUE}
+# Confusion matrix
+predicted_probabilities <- df_test$model_prediction_random_forest_classifier
+predicted_probabilities[predicted_probabilities > 0.5] <- 1
+predicted_probabilities[predicted_probabilities <= 0.5] <- 0
+predicted_probabilities <- predicted_probabilities %>% as.vector %>% as.factor
+observed <- df_test$nrwpcent_class
+confusionMatrix(data=predicted_probabilities, reference=observed)
+```
+
+However, if we consider the test set confusion matrix, we find that this model has a lower accuracy of 52%.
+
+## Gradient Boosted Classifier
+
+Lastly, we create a gradient boosted classifier:
+
+```{r cache=TRUE, include=FALSE}
+set.seed(1)
+gradient_boosted_classifier <- gbm(nrwpcent_class ~ REGION + WD.Area + conn + 
+                                     conn_p_area + cities + Mun1 + Mun2 + Mun3 +
+                                     Mun4 + Mun5 + gw + sprw + surw + elevar + coastal + emp,
+                              data=df_train %>% 
+                                mutate(nrwpcent_class=as.character(nrwpcent_class)),
+                              distribution="bernoulli",
+                              n.trees=10000)
+gradient_boosted_classifier %>% summary
+```
+
+As with our regression model, we see a strong association of predictive power from the `REGION` variable.
+
+```{r warning=FALSE, cache=TRUE}
+
+# Set n.trees to 10000
+df_test$model_prediction_gbm_classifier <- 
+  predict(gradient_boosted_classifier, newdata = df_test %>% 
+            mutate(nrwpcent_class=as.character(nrwpcent_class)), n.trees = 10000, type = "response")
+
+gbm_classifier_roc <- roc(df_test$nrwpcent_class, df_test$model_prediction_gbm_classifier)
+
+auc_score <- gbm_classifier_roc$auc
+
+cbind(rev(gbm_classifier_roc$specificities), rev(gbm_classifier_roc$sensitivities)) %>%
+  as.data.frame() %>%
+  rename('Specificity'=V1, 'Sensitivity'=V2) %>%
+  ggplot(aes(x=Specificity, y=Sensitivity)) +
+  geom_segment(aes(x = 0, y = 1, xend = 1,yend = 0), alpha = 0.5)  +
+  geom_step() +
+  scale_x_reverse(name = "Specificity",limits = c(1,0), expand = c(0.001,0.001)) +
+  scale_y_continuous(name = "Sensitivity", limits = c(0,1), expand = c(0.001, 0.001)) +
+  labs(title=paste("Area under the curve:", auc_score, sep=" ")) +
+  theme_minimal()
+```
+
+
+The GBM classifier has an AUC in the test set at 0.504.
+
+```{r cache=TRUE}
+# Confusion matrix
+predicted_probabilities_gbm <- df_test$model_prediction_gbm_classifier
+predicted_probabilities_gbm[predicted_probabilities_gbm > 0.5] <- 1
+predicted_probabilities_gbm[predicted_probabilities_gbm <= 0.5] <- 0
+predicted_probabilities_gbm <- predicted_probabilities_gbm %>% 
+  as.vector %>% as.integer %>% as.factor
+observed_gbm <- df_test$nrwpcent_class %>% as.factor
+confusionMatrix(data=predicted_probabilities_gbm, reference=observed_gbm)
+```
+
+Interestingly, the accuracy of this model is 52%, similar to the random forest model.
+
+It should be noted that in a previous exercise using linear regression, we also had accuracy metrics in the range of ~50%. 
+
+# Conclusions and Recommendations
+
+In terms of the regression problem, we have the following test RMSE metrics:
+
+| Model         | RMSE          |
+| :------------ | :-----------: | 
+| Decision Tree | 0.268         | 
+| Random Forest | 0.246         | 
+| GBM           | 0.261         | 
+
+In terms of the classification problem, we have the following AUC and test accuracy metrics:
+
+| Model         | AUC           | Accuracy      |
+| :------------ | :-----------: | :-----------: | 
+| Decision Tree | 0.535         | 56%           |
+| Random Forest | 0.550         | 52%           |
+| GBM           | 0.504         | 52%           |
+
+In all tree-based models, we found `REGION` to be an important feature. If we wish to maximize test prediction performance for the regression task, we recommend deploying the random forest model since this had the lowest RMSE. For the classification problem, the pruned decision tree is recommended as it has the highest accuracy.
